@@ -777,6 +777,315 @@ function Gaps({ stats, db }) {
   );
 }
 
+// ─── Hunter tab ───────────────────────────────────────────────────────────────
+function Hunter({ db }) {
+  const [state, setState] = useState(null);
+
+  useEffect(() => {
+    if (!db) { setState(null); return; }
+    const q = sql => { try { return execDb(db, sql).rows || []; } catch (e) { return []; } };
+    const scalar = (sql, d = 0) => q(sql)[0]?.n ?? d;
+
+    const tableExists = name => q(`SELECT name n FROM sqlite_master WHERE type='table' AND name='${name}'`).length > 0;
+    const hasCandidates = tableExists("peq_recovery_candidates");
+    const hasRecovered  = tableExists("peq_posts_recovered");
+    const hasTelemetry  = tableExists("hunter_telemetry");
+    const hasProposals  = tableExists("hunter_proposals");
+
+    setState({
+      hasCandidates, hasRecovered, hasTelemetry, hasProposals,
+      candByStatus: hasCandidates ? q(`SELECT status, COUNT(*) n FROM peq_recovery_candidates GROUP BY status ORDER BY n DESC`) : [],
+      candTotal:    hasCandidates ? scalar(`SELECT COUNT(*) n FROM peq_recovery_candidates`) : 0,
+      candByHint:   hasCandidates ? q(`SELECT hint, COUNT(*) n FROM peq_recovery_candidates GROUP BY hint ORDER BY n DESC`) : [],
+      candByYear:   hasCandidates ? q(`SELECT substr(inferred_date,1,4) yr, COUNT(*) n FROM peq_recovery_candidates WHERE inferred_date IS NOT NULL GROUP BY yr ORDER BY yr`) : [],
+      candByConf:   hasCandidates ? q(`
+        SELECT
+          CASE WHEN confidence >= 0.9 THEN 'high (>=0.9)'
+               WHEN confidence >= 0.7 THEN 'med  (>=0.7)'
+               WHEN confidence >= 0.5 THEN 'low  (>=0.5)'
+               ELSE 'minimal (<0.5)' END AS bucket,
+          COUNT(*) n
+        FROM peq_recovery_candidates WHERE status='pending' GROUP BY bucket`) : [],
+      recovered: hasRecovered ? q(`
+        SELECT id, proposed_post_date, proposed_post_title, proposed_post_author,
+               source, source_url, source_original_url, confidence, reviewed
+        FROM peq_posts_recovered ORDER BY id DESC LIMIT 25`) : [],
+      recoveredCounts: hasRecovered ? q(`SELECT reviewed, COUNT(*) n FROM peq_posts_recovered GROUP BY reviewed`) : [],
+      telemetry: hasTelemetry ? q(`
+        SELECT source,
+               SUM(enumerated) enumerated,
+               SUM(fetched_ok) fetched_ok,
+               SUM(fetched_fail) fetched_fail,
+               SUM(accepted) accepted,
+               SUM(rejected) rejected,
+               MAX(day) last_day
+        FROM hunter_telemetry GROUP BY source ORDER BY accepted DESC`) : [],
+      proposals: hasProposals ? q(`
+        SELECT id, created_at, kind, title, status
+        FROM hunter_proposals WHERE status='open' ORDER BY created_at DESC LIMIT 20`) : [],
+    });
+  }, [db]);
+
+  if (!db) {
+    return (
+      <div style={{ textAlign: "center", padding: "70px 0", color: K.muted }}>
+        <div style={{ fontSize: 36, marginBottom: 12 }}>🎯</div>
+        <p style={{ fontFamily: "monospace", fontSize: 13 }}>Hunter requires a real .sqlite file.</p>
+        <p style={{ fontFamily: "monospace", fontSize: 11, marginTop: 6, color: K.border }}>
+          Drop your <code style={{ background: K.dim, padding: "1px 5px", borderRadius: 3, color: K.text }}>powerpage.db</code> via the 📂 button.
+        </p>
+      </div>
+    );
+  }
+
+  if (!state) return <div style={{ color: K.muted, fontFamily: "monospace", fontSize: 12, padding: 20 }}>loading…</div>;
+
+  // Cold-start empty state — neither recovery table exists yet
+  if (!state.hasCandidates && !state.hasRecovered) {
+    return (
+      <div>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 18, flexWrap: "wrap" }}>
+          <h2 style={{ margin: 0, fontFamily: "Georgia,serif", fontSize: 24, fontWeight: 700, letterSpacing: -.5 }}>Hunter</h2>
+          <span style={{ fontFamily: "monospace", fontSize: 11, color: K.muted }}>archive recovery pipeline · not yet initialized</span>
+        </div>
+        <div style={{ background: K.card, border: `1px solid ${K.border}`, borderRadius: 10, padding: "30px 32px", textAlign: "left", lineHeight: 1.65 }}>
+          <p style={{ margin: "0 0 12px", fontFamily: "monospace", fontSize: 13, color: K.text }}>
+            The recovery pipeline tables don't exist yet in this database.
+          </p>
+          <p style={{ margin: "0 0 18px", fontFamily: "monospace", fontSize: 12, color: K.muted }}>
+            Run the Wayback scraper to populate <code style={{ background: K.dim, padding: "1px 5px", borderRadius: 3, color: K.text }}>peq_recovery_candidates</code> and <code style={{ background: K.dim, padding: "1px 5px", borderRadius: 3, color: K.text }}>peq_posts_recovered</code>:
+          </p>
+          <pre style={{ background: K.ink, border: `1px solid ${K.dim}`, borderRadius: 6, padding: "12px 14px", fontFamily: "monospace", fontSize: 12, color: K.gold, margin: "0 0 20px", overflowX: "auto" }}>
+{`bin/wayback-recover.py enumerate
+bin/wayback-recover.py fetch --limit 100`}
+          </pre>
+          <p style={{ margin: 0, fontFamily: "monospace", fontSize: 11, color: K.muted }}>
+            Full design and the 24/7 daemon roadmap: <a href="https://github.com/jasonogrady/pp-twin/blob/main/HUNTER.md" target="_blank" rel="noreferrer" style={{ color: K.blue, textDecoration: "none" }}>HUNTER.md ↗</a>
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  const pending  = state.candByStatus.find(r => r.status === "pending")?.n  || 0;
+  const fetched  = state.candByStatus.find(r => r.status === "fetched")?.n  || 0;
+  const failed   = state.candByStatus.find(r => r.status === "failed")?.n   || 0;
+  const inReview = state.recoveredCounts.find(r => r.reviewed === 0)?.n  || 0;
+  const accepted = state.recoveredCounts.find(r => r.reviewed === 1)?.n  || 0;
+  const rejected = state.recoveredCounts.find(r => r.reviewed === -1)?.n || 0;
+
+  const Card = ({ label, value, color }) => (
+    <div style={{ background: K.card, border: `1px solid ${K.border}`, borderRadius: 10, padding: "14px 16px" }}>
+      <div style={{ fontSize: 9, fontWeight: 700, color: K.muted, textTransform: "uppercase", letterSpacing: 2, fontFamily: "monospace", marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 22, fontWeight: 700, color: color || K.text, fontFamily: "Georgia,serif" }}>{value}</div>
+    </div>
+  );
+
+  const SectionHeader = ({ children, right }) => (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 12, flexWrap: "wrap", gap: 6 }}>
+      <p style={{ margin: 0, fontSize: 9, fontWeight: 700, color: K.muted, textTransform: "uppercase", letterSpacing: 2, fontFamily: "monospace" }}>{children}</p>
+      {right}
+    </div>
+  );
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 18, flexWrap: "wrap" }}>
+        <h2 style={{ margin: 0, fontFamily: "Georgia,serif", fontSize: 24, fontWeight: 700, letterSpacing: -.5 }}>Hunter</h2>
+        <span style={{ fontFamily: "monospace", fontSize: 11, color: K.muted }}>
+          archive recovery pipeline · staged candidates → fetched bodies → human review
+        </span>
+      </div>
+
+      {/* Top metrics */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(170px,1fr))", gap: 12, marginBottom: 18 }}>
+        <Card label="Candidates"     value={state.candTotal.toLocaleString()} color={K.text} />
+        <Card label="Pending Fetch"  value={pending.toLocaleString()}         color={K.gold} />
+        <Card label="Fetched"        value={fetched.toLocaleString()}         color={K.blue} />
+        <Card label="Failed"         value={failed.toLocaleString()}          color={failed > 0 ? K.red : K.muted} />
+        <Card label="In Review"      value={inReview.toLocaleString()}        color={inReview > 0 ? K.gold : K.muted} />
+        <Card label="Accepted"       value={accepted.toLocaleString()}        color={K.green} />
+        <Card label="Rejected"       value={rejected.toLocaleString()}        color={K.muted} />
+      </div>
+
+      {/* Sources (live telemetry once daemon exists, otherwise stub) */}
+      <div style={{ background: K.card, border: `1px solid ${K.border}`, borderRadius: 10, padding: "16px 18px", marginBottom: 14 }}>
+        <SectionHeader right={
+          <span style={{ fontFamily: "monospace", fontSize: 10, color: K.muted }}>
+            {state.hasTelemetry ? `${state.telemetry.length} active` : "daemon not yet running — populated by hunter_telemetry"}
+          </span>
+        }>Sources</SectionHeader>
+        {state.hasTelemetry && state.telemetry.length > 0 ? (
+          <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "monospace", fontSize: 12 }}>
+            <thead>
+              <tr style={{ color: K.muted, borderBottom: `1px solid ${K.border}` }}>
+                <th style={{ textAlign: "left",  padding: "8px 6px", fontWeight: 600 }}>Source</th>
+                <th style={{ textAlign: "right", padding: "8px 6px", fontWeight: 600 }}>Enumerated</th>
+                <th style={{ textAlign: "right", padding: "8px 6px", fontWeight: 600 }}>Fetched</th>
+                <th style={{ textAlign: "right", padding: "8px 6px", fontWeight: 600 }}>Failed</th>
+                <th style={{ textAlign: "right", padding: "8px 6px", fontWeight: 600 }}>Accepted</th>
+                <th style={{ textAlign: "right", padding: "8px 6px", fontWeight: 600 }}>Accept %</th>
+                <th style={{ textAlign: "left",  padding: "8px 6px", fontWeight: 600 }}>Last seen</th>
+              </tr>
+            </thead>
+            <tbody>
+              {state.telemetry.map(t => {
+                const total = (t.accepted || 0) + (t.rejected || 0);
+                const rate = total > 0 ? Math.round(100 * t.accepted / total) : null;
+                return (
+                  <tr key={t.source} style={{ borderBottom: `1px solid ${K.dim}`, color: K.text }}>
+                    <td style={{ padding: "6px", color: K.gold }}>{t.source}</td>
+                    <td style={{ padding: "6px", textAlign: "right" }}>{(t.enumerated || 0).toLocaleString()}</td>
+                    <td style={{ padding: "6px", textAlign: "right", color: K.blue }}>{(t.fetched_ok || 0).toLocaleString()}</td>
+                    <td style={{ padding: "6px", textAlign: "right", color: t.fetched_fail > 0 ? K.red : K.muted }}>{(t.fetched_fail || 0).toLocaleString()}</td>
+                    <td style={{ padding: "6px", textAlign: "right", color: K.green }}>{(t.accepted || 0).toLocaleString()}</td>
+                    <td style={{ padding: "6px", textAlign: "right", color: K.muted }}>{rate !== null ? `${rate}%` : "—"}</td>
+                    <td style={{ padding: "6px", color: K.muted }}>{t.last_day || "—"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        ) : (
+          <div style={{ fontFamily: "monospace", fontSize: 12, color: K.muted, padding: "10px 4px" }}>
+            {[
+              ["wayback",      "archive.org CDX scraper — bin/wayback-recover.py exists"],
+              ["archive.today","not built"],
+              ["common_crawl", "not built"],
+              ["macrumors",    "not built"],
+              ["local_mail",   "not built — mdfind Mail.app + Gmail Takeout"],
+              ["local_backups","not built — mdfind /Volumes"],
+            ].map(([name, note]) => (
+              <div key={name} style={{ display: "flex", gap: 12, padding: "3px 0", borderBottom: `1px solid ${K.dim}` }}>
+                <span style={{ color: K.gold, minWidth: 120 }}>{name}</span>
+                <span>{note}</span>
+              </div>
+            ))}
+            <div style={{ marginTop: 10, color: K.border }}>
+              See <a href="https://github.com/jasonogrady/pp-twin/blob/main/HUNTER.md" target="_blank" rel="noreferrer" style={{ color: K.blue, textDecoration: "none" }}>HUNTER.md ↗</a> for the source-adapter design.
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Distributions */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 14 }}>
+        {/* Confidence */}
+        <div style={{ background: K.card, border: `1px solid ${K.border}`, borderRadius: 10, padding: "14px 16px" }}>
+          <SectionHeader>Confidence · pending</SectionHeader>
+          {state.candByConf.length === 0 ? (
+            <div style={{ fontFamily: "monospace", fontSize: 11, color: K.muted }}>no pending candidates</div>
+          ) : state.candByConf.map(r => (
+            <div key={r.bucket} style={{ display: "flex", justifyContent: "space-between", fontFamily: "monospace", fontSize: 12, padding: "4px 0", borderBottom: `1px solid ${K.dim}` }}>
+              <span style={{ color: K.text }}>{r.bucket}</span>
+              <span style={{ color: K.gold }}>{r.n.toLocaleString()}</span>
+            </div>
+          ))}
+        </div>
+
+        {/* Hint */}
+        <div style={{ background: K.card, border: `1px solid ${K.border}`, borderRadius: 10, padding: "14px 16px" }}>
+          <SectionHeader>URL Patterns Matched</SectionHeader>
+          {state.candByHint.length === 0 ? (
+            <div style={{ fontFamily: "monospace", fontSize: 11, color: K.muted }}>nothing staged</div>
+          ) : state.candByHint.slice(0, 10).map(r => (
+            <div key={r.hint || "(none)"} style={{ display: "flex", justifyContent: "space-between", fontFamily: "monospace", fontSize: 12, padding: "4px 0", borderBottom: `1px solid ${K.dim}` }}>
+              <span style={{ color: K.text }}>{r.hint || <em style={{ color: K.muted }}>(none)</em>}</span>
+              <span style={{ color: K.gold }}>{r.n.toLocaleString()}</span>
+            </div>
+          ))}
+        </div>
+
+        {/* Year */}
+        <div style={{ background: K.card, border: `1px solid ${K.border}`, borderRadius: 10, padding: "14px 16px" }}>
+          <SectionHeader>Inferred Date · by Year</SectionHeader>
+          {state.candByYear.length === 0 ? (
+            <div style={{ fontFamily: "monospace", fontSize: 11, color: K.muted }}>no dated candidates</div>
+          ) : (
+            <div style={{ maxHeight: 220, overflowY: "auto" }}>
+              {state.candByYear.map(r => (
+                <div key={r.yr} style={{ display: "flex", justifyContent: "space-between", fontFamily: "monospace", fontSize: 12, padding: "3px 0", borderBottom: `1px solid ${K.dim}` }}>
+                  <span style={{ color: K.text }}>{r.yr}</span>
+                  <span style={{ color: K.gold }}>{r.n.toLocaleString()}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Open proposals (hunter_proposals — daemon-only) */}
+      {state.hasProposals && state.proposals.length > 0 && (
+        <div style={{ background: K.card, border: `1px solid ${K.border}`, borderRadius: 10, padding: "16px 18px", marginBottom: 14 }}>
+          <SectionHeader right={<span style={{ fontFamily: "monospace", fontSize: 10, color: K.muted }}>self-improvement suggestions from the daemon</span>}>
+            Open Proposals · {state.proposals.length}
+          </SectionHeader>
+          {state.proposals.map(p => (
+            <div key={p.id} style={{ display: "flex", gap: 12, padding: "8px 4px", borderBottom: `1px solid ${K.dim}`, fontFamily: "monospace", fontSize: 12 }}>
+              <span style={{ color: K.muted, minWidth: 100 }}>{(p.created_at || "").slice(0, 10)}</span>
+              <span style={{ color: K.blue, minWidth: 90 }}>{p.kind}</span>
+              <span style={{ color: K.text, flex: 1 }}>{p.title}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Review queue */}
+      <div style={{ background: K.card, border: `1px solid ${K.border}`, borderRadius: 10, padding: "16px 18px" }}>
+        <SectionHeader right={<span style={{ fontFamily: "monospace", fontSize: 10, color: K.muted }}>{inReview > 25 ? `showing 25 of ${inReview}` : `${state.recovered.length} total`}</span>}>
+          Review Queue
+        </SectionHeader>
+        {state.recovered.length === 0 ? (
+          <div style={{ fontFamily: "monospace", fontSize: 12, color: K.muted, padding: "10px 4px" }}>
+            No recovered posts yet. Run <code style={{ background: K.dim, padding: "1px 5px", borderRadius: 3, color: K.text }}>bin/wayback-recover.py fetch</code> to populate.
+          </div>
+        ) : (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "monospace", fontSize: 12 }}>
+              <thead>
+                <tr style={{ color: K.muted, borderBottom: `1px solid ${K.border}` }}>
+                  <th style={{ textAlign: "left",  padding: "8px 6px", fontWeight: 600 }}>Date</th>
+                  <th style={{ textAlign: "left",  padding: "8px 6px", fontWeight: 600 }}>Title</th>
+                  <th style={{ textAlign: "left",  padding: "8px 6px", fontWeight: 600 }}>Author</th>
+                  <th style={{ textAlign: "left",  padding: "8px 6px", fontWeight: 600 }}>Source</th>
+                  <th style={{ textAlign: "right", padding: "8px 6px", fontWeight: 600 }}>Conf</th>
+                  <th style={{ textAlign: "left",  padding: "8px 6px", fontWeight: 600 }}>State</th>
+                  <th style={{ textAlign: "left",  padding: "8px 6px", fontWeight: 600 }}>Link</th>
+                </tr>
+              </thead>
+              <tbody>
+                {state.recovered.map(r => {
+                  const stateLabel = r.reviewed === 1 ? "accepted" : r.reviewed === -1 ? "rejected" : "pending";
+                  const stateColor = r.reviewed === 1 ? K.green : r.reviewed === -1 ? K.red : K.gold;
+                  return (
+                    <tr key={r.id} style={{ borderBottom: `1px solid ${K.dim}`, color: K.text }}>
+                      <td style={{ padding: "6px", color: K.muted, whiteSpace: "nowrap" }}>{(r.proposed_post_date || "").slice(0, 10)}</td>
+                      <td style={{ padding: "6px", maxWidth: 380, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.proposed_post_title || ""}>
+                        {r.proposed_post_title || <em style={{ color: K.muted }}>(no title)</em>}
+                      </td>
+                      <td style={{ padding: "6px", color: K.muted }}>{r.proposed_post_author || "—"}</td>
+                      <td style={{ padding: "6px", color: K.blue }}>{r.source}</td>
+                      <td style={{ padding: "6px", textAlign: "right", color: K.muted }}>{r.confidence != null ? r.confidence.toFixed(2) : "—"}</td>
+                      <td style={{ padding: "6px", color: stateColor }}>{stateLabel}</td>
+                      <td style={{ padding: "6px" }}>
+                        {r.source_url && <a href={r.source_url} target="_blank" rel="noreferrer" style={{ color: K.blue, textDecoration: "none" }}>↗</a>}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <div style={{ marginTop: 12, fontFamily: "monospace", fontSize: 10, color: K.border }}>
+          Accept/reject controls are read-only here for now. Apply decisions via SQL:
+          <code style={{ background: K.dim, padding: "1px 5px", borderRadius: 3, color: K.muted, marginLeft: 6 }}>UPDATE peq_posts_recovered SET reviewed = 1 WHERE id = …</code>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── sql.js loader ────────────────────────────────────────────────────────────
 let _sql=null;
 const getSQL=()=>{
@@ -918,6 +1227,7 @@ export default function App() {
     {id:"explorer", label:"SQL Explorer"},
     {id:"calendar", label:"Post Calendar"},
     {id:"gaps",     label:"Gaps"},
+    {id:"hunter",   label:"Hunter"},
   ];
 
   const yearPosts=stats.byDay.filter(d=>d.day.startsWith(String(year))).reduce((s,r)=>s+(+r.count),0);
@@ -994,6 +1304,10 @@ export default function App() {
 
         {tab==="gaps"&&(
           <Gaps stats={stats} db={dbInst}/>
+        )}
+
+        {tab==="hunter"&&(
+          <Hunter db={dbInst}/>
         )}
 
         {tab==="calendar"&&(
