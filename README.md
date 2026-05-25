@@ -2,7 +2,7 @@
 
 A local archive explorer + recovery toolkit for [O'Grady's PowerPage](https://www.powerpage.org) — a long-running Apple/Mac blog. Pulls your WordPress database nightly, gives you an instant dashboard, an editorial cockpit, gap analysis, and a Wayback-Machine-driven recovery pipeline for lost posts.
 
-![status](https://img.shields.io/badge/status-v1.0-gold) ![license](https://img.shields.io/badge/license-MIT-green)
+![status](https://img.shields.io/badge/status-v1.1-gold) ![license](https://img.shields.io/badge/license-MIT-green)
 
 ---
 
@@ -184,6 +184,16 @@ requirements.txt             Python deps for the scraper
 ---
 
 ## Changelog
+
+### v1.1 — Hunter ships
+- **24/7 cloud Hunter** via GitHub Actions cron (`.github/workflows/hunter.yml`): every 2h, one bounded `tick` enumerates a stale gap and fetches up to 30 candidates, commits `recovery/hunter.db` back to main, concurrency-locked
+- **Hunter tab** in pp-twin: 7 stat cards, animated braille status strip, per-source telemetry stub, confidence + URL-pattern + year distributions, open proposals panel, review queue with snapshot links
+- **Live activity log** in Hunter tab — terminal-style tail of the last 40 fetched/failed events, each row with its own cycling braille spinner; auto-derived from `peq_posts_recovered.created_at`
+- **Mobile-native**: Hunter tab auto-fetches `recovery/hunter.db` (~1.4 MB) from GitHub when no local DB is loaded — phones get a working live view with zero setup
+- **Recovery extractor improvements**: retry/backoff on Wayback fetch (cuts failure rate ~50%), slug-as-title fallback for pre-2008 MovableType templates, day-15 anchor for month-precision URLs (eliminates day-01 false precision + snapshot-date clustering)
+- **Hosting**: Cloudflare Pages deploy config (`wrangler.jsonc`, `bin/deploy-pages.sh`) — app lives at https://pp-twin.pages.dev
+- **Wayback scraper hardening**: `--db PATH` via `HUNTER_DB` env, `--no-body`, `tick`, `retry-failed`, `rebuild-titles` subcommands; gap windows chunked to ≤365d (CDX no longer 504s on multi-year prefix scans)
+- **Docs**: new `HUNTER.md` design + currently-shipped operate guide
 
 ### v1.0 — editor cockpit + automation
 - **Editor dashboard** on Post Calendar tab: 16 metrics + 52-week sparkline + top weeks + most-discussed posts
