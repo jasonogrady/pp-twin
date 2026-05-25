@@ -16,11 +16,18 @@ set -euo pipefail
 
 # --- config ------------------------------------------------------------------
 PROJECT_DIR="${PROJECT_DIR:-/Users/jason/Library/Mobile Documents/com~apple~CloudDocs/GitHub/pp-twin}"
-REMOTE_USER="powerpa3"
-REMOTE_HOST="box2305.bluehost.com"
-REMOTE_WP_DIR="public_html"
-SSH_KEY="$HOME/.ssh/id_ed25519_bluehost"
-KEEP_DAYS=7
+
+# Load .env if present so secrets/host details stay out of git. See .env.example.
+if [ -f "$PROJECT_DIR/.env" ]; then
+  # shellcheck disable=SC1091
+  set -a; . "$PROJECT_DIR/.env"; set +a
+fi
+
+REMOTE_USER="${REMOTE_USER:?REMOTE_USER not set; create .env from .env.example}"
+REMOTE_HOST="${REMOTE_HOST:?REMOTE_HOST not set; create .env from .env.example}"
+REMOTE_WP_DIR="${REMOTE_WP_DIR:-public_html}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519_bluehost}"
+KEEP_DAYS="${KEEP_DAYS:-7}"
 
 # --- paths -------------------------------------------------------------------
 cd "$PROJECT_DIR"

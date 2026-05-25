@@ -76,9 +76,11 @@ Then apply gap analysis views: `sqlite3 powerpage.db < sql/gap-views.sql`
 
 ### 3. Automate the sync (optional, recommended)
 
-Edit `bin/sync-from-bluehost.sh` to match your host/user, then:
+Copy `.env.example` to `.env` and fill in your SSH host/user (the script sources `.env` — `.env` itself is gitignored). Then:
 
 ```zsh
+cp .env.example .env
+$EDITOR .env                                              # set REMOTE_USER, REMOTE_HOST, SSH_KEY
 ssh-add --apple-use-keychain ~/.ssh/id_ed25519_yourhost   # cache passphrase
 bin/sync-from-bluehost.sh                                 # dry-run
 bin/install-launchd.sh install                            # schedule daily at 3:30 AM
