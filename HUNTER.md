@@ -249,6 +249,75 @@ Once a week, a small job concatenates the week's telemetry and 20 failure sample
 
 ---
 
+## Headless monitoring
+
+Three complementary surfaces. None of them require an extra always-on app — they piggyback on tools you already have.
+
+### 1. ntfy.sh push (real-time, "find out when something matters")
+
+The daemon sends a one-line POST on events worth your attention. Free, no account, install the iOS app once and you get push notifications anywhere.
+
+```python
+# bin/hunter/notify.py
+import requests
+NTFY_TOPIC = "pp-twin-hunter-<random-suffix>"  # secret-ish; topic is the URL
+
+def notify(title: str, body: str, priority: int = 3, tags: list[str] | None = None):
+    requests.post(
+        f"https://ntfy.sh/{NTFY_TOPIC}",
+        data=body.encode("utf-8"),
+        headers={
+            "Title": title,
+            "Priority": str(priority),
+            "Tags": ",".join(tags or []),
+        },
+        timeout=10,
+    )
+```
+
+What to notify on (and at what priority):
+
+| Event | Priority | Example |
+|---|---|---|
+| Critical source failure | 4 (high) | "wayback returning 503 for 30+ min — daemon pausing" |
+| New proposal opened | 3 (default) | "Extractor proposal: `/story.php?id=*` body selector (23 samples)" |
+| Daily digest at 9 AM | 2 (low) | "Yesterday: 234 fetched, 41 accepted, 0 new proposals" |
+| Milestone hit | 3 | "Range 2007-09 → 2008-12 now 84% recovered (was 0%)" |
+| New high-confidence URL pattern | 2 | "Promoted pattern: `/news/YYYY/MM/DD/` (89% accept rate over 47 samples)" |
+
+Subscribe on iOS: install [ntfy](https://apps.apple.com/app/ntfy/id1625396347), add topic `pp-twin-hunter-<suffix>`. Subscribe on the web: open `https://ntfy.sh/pp-twin-hunter-<suffix>` in a browser. No backend, no auth, no ongoing cost.
+
+(Pushover and ntfy self-hosted are drop-in alternatives if you prefer.)
+
+### 2. TUI dashboard (live picture, SSH-friendly)
+
+`bin/hunter/tui.py` built on [Textual](https://textual.textualize.io/). Read-only against the daemon's tables. Refresh every 2s.
+
+```
+┌─ Hunter ──────────────────────────── 2026-05-24 16:42 ┐
+│ wayback     ▇▇▇▇▇▇▇▇▁▁  243/420  acc 12%  rate 50/min│
+│ archive.ph  ▇▇▇▁▁▁▁▁▁▁   31/180  acc  8%  rate 20/min│
+│ commoncrawl ▇▇▇▇▇▇▇▇▇▇  812/812  acc 22%  rate idle  │
+│ macrumors   ▁▁▁▁▁▁▁▁▁▁    0/—   backoff (429)        │
+│                                                       │
+│ Last 5 accepted:                                      │
+│ 2008-03-14 · "Apple ships 10.5.2 update"  · wayback   │
+│ ...                                                   │
+│ Open proposals: 3 (press P to view)                   │
+│ Pending review: 87 (press R to open review queue)     │
+└───────────────────────────────────────────────────────┘
+```
+
+SSH into the mini, `bin/hunter/tui.py`, see live state in 1s. Zero deploy, zero browser.
+
+### 3. pp-twin "Hunter" tab (work surface, web-reachable)
+
+Lives at your Cloudflare Pages URL. Reads the same SQLite tables as the TUI but adds the interactive parts: accept/reject the review queue, accept/dismiss/snooze proposals, promote/demote URL patterns. This is where the actual human work happens; the TUI and ntfy are read-only signals.
+
+### Why this stack, not a standalone web dashboard
+
+A separate hunter web dashboard (Cloudflare Tunnel → local HTTP server → static page polling JSON) is more code and more moving parts for the same information. The trio above already covers all three modes — *find out*, *look at*, *work on* — without a new long-running web server. Add it later only if you want a dashboard reachable from a phone without the ntfy app installed.
+
 ## pp-twin integration
 
 New tab: **Hunter**.

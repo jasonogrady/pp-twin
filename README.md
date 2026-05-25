@@ -129,19 +129,42 @@ Candidates are staged into `peq_recovery_candidates`; extracted posts land in `p
 
 ---
 
+## Hosting (Cloudflare Pages)
+
+The app shell is static — the database stays on your machine. Host the shell at a permanent URL; the "📂 Load powerpage.db" picker handles the local file every time.
+
+One-time setup:
+
+```zsh
+npm install -g wrangler           # or use npx
+wrangler login                    # browser auth, ~30 seconds
+bin/deploy-pages.sh               # builds pp-twin-dev/ and creates the Pages project
+```
+
+This prints a URL like `https://pp-twin.pages.dev` — bookmark it.
+
+Auto-deploy on every push (recommended): connect the GitHub repo via the Cloudflare dashboard → Workers & Pages → pp-twin → Settings → Builds & deployments → Git integration. Then every `git push origin main` rebuilds and redeploys in ~30s.
+
+To attach a custom domain (e.g. `twin.powerpage.org`): Pages project → Custom domains → Set up.
+
+Re-deploy manually any time: `bin/deploy-pages.sh`.
+
 ## Repo layout
 
 ```
 pp-twin.jsx                  source-of-truth single-file artifact
 pp-twin-dev/                 Vite + React workspace (App.jsx is a copy of pp-twin.jsx)
+wrangler.jsonc               Cloudflare Pages config
 bin/
   sync-from-bluehost.sh      daily DB sync (launchd-driven)
   ai.ogrady.pptwin-sync.plist
   install-launchd.sh         load/unload the LaunchAgent
   wayback-recover.py         CDX-based archive scraper
+  deploy-pages.sh            build + deploy pp-twin to Cloudflare Pages
 sql/
   gap-views.sql              gap_days / gap_ranges / gap_summary
 RECOVERY.md                  archive-recovery plan + source ranking
+HUNTER.md                    24/7 self-improving recovery daemon (design)
 requirements.txt             Python deps for the scraper
 ```
 

@@ -1,0 +1,6 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "pp-twin",
+  "compatibility_date": "2026-05-24",
+  "pages_build_output_dir": "./pp-twin-dev/dist"
+}
