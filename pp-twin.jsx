@@ -797,12 +797,41 @@ function Spinner({ offset = 0, color, char }) {
   </span>;
 }
 
+const CLOUD_HUNTER_DB_URL = "https://raw.githubusercontent.com/jasonogrady/pp-twin/main/recovery/hunter.db";
+
 function Hunter({ db, onReload }) {
   const [state, setState] = useState(null);
+  const [cloudDb, setCloudDb] = useState(null);
+  const [cloudLoading, setCloudLoading] = useState(false);
+  const [cloudError, setCloudError] = useState(null);
+
+  // If no local DB is loaded, auto-fetch the cloud-managed recovery/hunter.db.
+  // This is what makes the Hunter tab work on mobile / fresh browsers with zero setup.
+  useEffect(() => {
+    if (db || cloudDb || cloudLoading) return;
+    setCloudLoading(true);
+    (async () => {
+      try {
+        const SQL = await getSQL();
+        const r = await fetch(CLOUD_HUNTER_DB_URL, { cache: "no-store" });
+        if (!r.ok) throw new Error(`fetch ${r.status}`);
+        const buf = await r.arrayBuffer();
+        const d = new SQL.Database(new Uint8Array(buf));
+        setCloudDb(d);
+      } catch (e) {
+        setCloudError(String(e.message || e));
+      } finally {
+        setCloudLoading(false);
+      }
+    })();
+  }, [db, cloudDb, cloudLoading]);
+
+  const effectiveDb = db || cloudDb;
+  const isCloudMode = !db && !!cloudDb;
 
   useEffect(() => {
-    if (!db) { setState(null); return; }
-    const q = sql => { try { return execDb(db, sql).rows || []; } catch (e) { return []; } };
+    if (!effectiveDb) { setState(null); return; }
+    const q = sql => { try { return execDb(effectiveDb, sql).rows || []; } catch (e) { return []; } };
     const scalar = (sql, d = 0) => q(sql)[0]?.n ?? d;
 
     const tableExists = name => q(`SELECT name n FROM sqlite_master WHERE type='table' AND name='${name}'`).length > 0;
@@ -858,15 +887,34 @@ function Hunter({ db, onReload }) {
         SELECT id, created_at, kind, title, status
         FROM hunter_proposals WHERE status='open' ORDER BY created_at DESC LIMIT 20`) : [],
     });
-  }, [db]);
+  }, [effectiveDb]);
 
-  if (!db) {
+  if (!effectiveDb) {
+    if (cloudLoading) {
+      return (
+        <div style={{ textAlign: "center", padding: "70px 0", color: K.muted, fontFamily: "monospace", fontSize: 12 }}>
+          <Spinner offset={0} color={K.gold}/> loading cloud snapshot…
+          <div style={{ marginTop: 8, fontSize: 10, color: K.border }}>fetching recovery/hunter.db from GitHub (~1.4 MB)</div>
+        </div>
+      );
+    }
+    if (cloudError) {
+      return (
+        <div style={{ textAlign: "center", padding: "70px 0", color: K.muted }}>
+          <div style={{ fontSize: 36, marginBottom: 12 }}>🎯</div>
+          <p style={{ fontFamily: "monospace", fontSize: 13, color: K.red }}>Couldn't load cloud snapshot: {cloudError}</p>
+          <p style={{ fontFamily: "monospace", fontSize: 11, marginTop: 6, color: K.border }}>
+            Drop a local <code style={{ background: K.dim, padding: "1px 5px", borderRadius: 3, color: K.text }}>powerpage.db</code> via the 📂 button instead.
+          </p>
+        </div>
+      );
+    }
     return (
       <div style={{ textAlign: "center", padding: "70px 0", color: K.muted }}>
         <div style={{ fontSize: 36, marginBottom: 12 }}>🎯</div>
-        <p style={{ fontFamily: "monospace", fontSize: 13 }}>Hunter requires a real .sqlite file.</p>
+        <p style={{ fontFamily: "monospace", fontSize: 13 }}>Hunter requires a SQLite source.</p>
         <p style={{ fontFamily: "monospace", fontSize: 11, marginTop: 6, color: K.border }}>
-          Drop your <code style={{ background: K.dim, padding: "1px 5px", borderRadius: 3, color: K.text }}>powerpage.db</code> via the 📂 button.
+          Drop a local <code style={{ background: K.dim, padding: "1px 5px", borderRadius: 3, color: K.text }}>powerpage.db</code> via the 📂 button, or wait for the cloud snapshot.
         </p>
       </div>
     );
@@ -941,11 +989,25 @@ bin/wayback-recover.py fetch --limit 100`}
         <span style={{ fontFamily: "monospace", fontSize: 11, color: K.muted }}>
           archive recovery pipeline · staged → fetched → review
         </span>
-        <div style={{ marginLeft: "auto" }}>
+        {isCloudMode && (
+          <span style={{ fontFamily: "monospace", fontSize: 10, color: K.gold, border: `1px solid ${K.gold}`, padding: "2px 8px", borderRadius: 4, letterSpacing: 1 }}>
+            ☁ CLOUD SNAPSHOT · read-only
+          </span>
+        )}
+        <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+          {isCloudMode && (
+            <button
+              onClick={() => { setCloudDb(null); setCloudError(null); }}
+              style={{ cursor: "pointer", padding: "4px 12px", border: `1px solid ${K.b2}`, borderRadius: 5, fontSize: 11, color: K.gold, fontFamily: "monospace", background: "transparent" }}
+              onMouseEnter={e => e.currentTarget.style.borderColor = K.gold}
+              onMouseLeave={e => e.currentTarget.style.borderColor = K.b2}>
+              ↻ Refetch cloud
+            </button>
+          )}
           <label style={{ cursor: "pointer", padding: "4px 12px", border: `1px solid ${K.b2}`, borderRadius: 5, fontSize: 11, color: K.muted, fontFamily: "monospace" }}
             onMouseEnter={e => e.currentTarget.style.borderColor = K.gold}
             onMouseLeave={e => e.currentTarget.style.borderColor = K.b2}>
-            🔄 Reload DB
+            🔄 {isCloudMode ? "Load local" : "Reload DB"}
             <input type="file" accept=".db,.sqlite,.sqlite3" style={{ display: "none" }}
               onChange={e => onReload && e.target.files[0] && onReload(e.target.files[0])} />
           </label>
