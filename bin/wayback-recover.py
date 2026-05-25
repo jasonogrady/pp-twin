@@ -95,7 +95,9 @@ def inferred_date_from_url(url, groups, hint):
         if hint == "wp-dated-slug" and len(groups) >= 3:
             return f"{groups[0]}-{int(groups[1]):02d}-{int(groups[2]):02d}"
         if hint == "wp-month-slug" and len(groups) >= 2:
-            return f"{groups[0]}-{int(groups[1]):02d}-01"
+            # Day-15: mid-month sentinel. We know the month from the URL but not the day;
+            # day-01 looks falsely precise and clusters everything onto the same date.
+            return f"{groups[0]}-{int(groups[1]):02d}-15"
         if hint == "news-dated" and len(groups) >= 3:
             return f"{groups[0]}-{int(groups[1]):02d}-{int(groups[2]):02d}"
     except Exception:
@@ -377,19 +379,16 @@ def cmd_fetch(args):
         print("No pending candidates. Run `enumerate` first.")
         return
     print(f"Fetching {len(rows)} candidates (min confidence={args.min_confidence or 'any'})…")
-    # Hints whose inferred_date has full day-precision; others (e.g. wp-month-slug)
-    # only know YYYY-MM and pad day=01, which is misleading — fall back to the
-    # snapshot timestamp instead.
-    PRECISE_INFERRED_HINTS = ("wp-dated-slug", "news-dated")
+    # Date priority: in-page > URL-inferred (already day-15 for month-precision)
+    # > snapshot timestamp (last resort; clusters by crawl date, not publication).
     ok = failed = 0
     for cand_id, url, ts, inferred, conf, hint in rows:
         try:
             html, snap_url = fetch_snapshot(ts, url)
             data = extract_post(html, url)
             in_page_date = normalize_date(data["date"])
-            precise_inferred = inferred if hint in PRECISE_INFERRED_HINTS else None
             snap_date = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[8:10]}:{ts[10:12]}:{ts[12:14]}"
-            best_date = in_page_date or precise_inferred or snap_date
+            best_date = in_page_date or inferred or snap_date
             conn.execute("""
                 INSERT INTO peq_posts_recovered
                   (candidate_id, proposed_post_date, proposed_post_title, proposed_post_content,
@@ -465,33 +464,52 @@ def cmd_retry_failed(args):
     conn.commit()
     print(f"Re-queued {n} failed candidates")
 
+_DATED_SLUG_RE = re.compile(r"/(\d{4})/(\d{1,2})/(\d{1,2})/[^/?#]+/?$")
+_MONTH_SLUG_RE = re.compile(r"/(\d{4})/(\d{1,2})/[^/?#]+\.html?$", re.I)
+
+def _best_date_from_url(url):
+    """Re-derive a publication date string (YYYY-MM-DD 00:00:00) from a URL, or None."""
+    if not url:
+        return None
+    m = _DATED_SLUG_RE.search(url)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d} 00:00:00"
+    m = _MONTH_SLUG_RE.search(url)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-15 00:00:00"
+    return None
+
 def cmd_rebuild_titles(args):
-    """Re-derive title from URL slug for already-recovered posts whose title looks like site chrome."""
+    """Re-derive title (slug-as-title) and date (mid-month for wp-month-slug URLs)
+       for pending recovered posts."""
     conn = open_db()
     rows = conn.execute("""
-        SELECT id, source_original_url, proposed_post_title, proposed_post_date,
-               (SELECT hint FROM peq_recovery_candidates c WHERE c.id = r.candidate_id),
-               (SELECT cdx_timestamp FROM peq_recovery_candidates c WHERE c.id = r.candidate_id)
-        FROM peq_posts_recovered r
+        SELECT id, source_original_url, proposed_post_title, proposed_post_date
+        FROM peq_posts_recovered
         WHERE reviewed = 0
     """).fetchall()
     updated = 0
-    for rid, url, title, date, hint, ts in rows:
+    for rid, url, title, date in rows:
         changes = {}
         if not title or SITE_CHROME_TITLE_RE.search(title or ""):
             new_title = _title_from_slug(url) if url else None
             if new_title:
                 changes["proposed_post_title"] = new_title
-        # If date ends with -01 00:00:00 and hint is month-precision, prefer snapshot ts
-        if hint not in ("wp-dated-slug", "news-dated") and date and date[8:10] == "01" and ts:
-            snap_date = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[8:10]}:{ts[10:12]}:{ts[12:14]}"
-            if snap_date != date:
-                changes["proposed_post_date"] = snap_date
+        # Always trust the URL's own date over whatever we stored (snap_date clustering, day-01 false precision)
+        url_date = _best_date_from_url(url)
+        if url_date and url_date != date:
+            changes["proposed_post_date"] = url_date
         if changes:
             sets = ", ".join(f"{k}=?" for k in changes)
             conn.execute(f"UPDATE peq_posts_recovered SET {sets} WHERE id=?",
                          (*changes.values(), rid))
             updated += 1
+    # Propagate day-15 anchor back into peq_recovery_candidates for status-view consistency
+    conn.execute("""
+        UPDATE peq_recovery_candidates
+        SET inferred_date = substr(inferred_date, 1, 8) || '15'
+        WHERE hint = 'wp-month-slug' AND substr(inferred_date, 9, 2) = '01'
+    """)
     conn.commit()
     print(f"Rebuilt {updated} pending recovered posts (titles + dates)")
 
