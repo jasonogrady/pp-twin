@@ -2,7 +2,7 @@
 
 A local archive explorer + recovery toolkit for [O'Grady's PowerPage](https://www.powerpage.org) — a long-running Apple/Mac blog. Pulls your WordPress database nightly, gives you an instant dashboard, an editorial cockpit, gap analysis, and a Wayback-Machine-driven recovery pipeline for lost posts.
 
-![status](https://img.shields.io/badge/status-v1.1-gold) ![license](https://img.shields.io/badge/license-MIT-green)
+![status](https://img.shields.io/badge/status-v1.1.1-gold) ![license](https://img.shields.io/badge/license-MIT-green)
 
 ---
 
@@ -186,6 +186,10 @@ requirements.txt             Python deps for the scraper
 ---
 
 ## Changelog
+
+### v1.1.1 — public + mobile-reachable
+- Repo flipped public so the Hunter tab's auto-fetched cloud snapshot (`recovery/hunter.db` from `raw.githubusercontent.com`) actually resolves anonymously — required for mobile browsers
+- SSH host/user (Bluehost target for the daily sync) moved out of `bin/sync-from-bluehost.sh` into a gitignored `.env`; `.env.example` documents the schema
 
 ### v1.1 — Hunter ships
 - **24/7 cloud Hunter** via GitHub Actions cron (`.github/workflows/hunter.yml`): every 2h, one bounded `tick` enumerates a stale gap and fetches up to 30 candidates, commits `recovery/hunter.db` back to main, concurrency-locked
