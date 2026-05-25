@@ -177,15 +177,35 @@ def cdx_query(host, ts_from, ts_to, retries=3):
             time.sleep(2 ** attempt)
 
 # ─── enumerate ────────────────────────────────────────────────────────────────
+MAX_WINDOW_DAYS = 365  # CDX prefix scans 504 on multi-year ranges; chunk to ≤1y
+
+def _chunk_window(start_iso, end_iso, max_days=MAX_WINDOW_DAYS):
+    """Split [start, end] (YYYY-MM-DD) into ≤max_days-long sub-ranges, returned as 8-digit pairs."""
+    from datetime import timedelta
+    a = datetime.strptime(start_iso, "%Y-%m-%d").date()
+    b = datetime.strptime(end_iso,   "%Y-%m-%d").date()
+    out = []
+    cur = a
+    while cur <= b:
+        nxt = min(cur + timedelta(days=max_days - 1), b)
+        out.append((cur.strftime("%Y%m%d"), nxt.strftime("%Y%m%d")))
+        cur = nxt + timedelta(days=1)
+    return out
+
 def gap_ranges_to_windows(conn, min_weekdays=5):
-    """Pull gap_ranges with at least N weekdays, return list of (from, to) 8-digit dates."""
+    """Pull gap_ranges with at least N weekdays, chunk to ≤MAX_WINDOW_DAYS each."""
     rows = conn.execute("""
         SELECT start_day, end_day, weekday_count
         FROM gap_ranges
         WHERE weekday_count >= ?
         ORDER BY weekday_count DESC
     """, (min_weekdays,)).fetchall()
-    return [(r[0].replace("-",""), r[1].replace("-",""), r[2]) for r in rows]
+    windows = []
+    for start_day, end_day, weekday_count in rows:
+        chunks = _chunk_window(start_day, end_day)
+        for ts_from, ts_to in chunks:
+            windows.append((ts_from, ts_to, weekday_count if len(chunks) == 1 else None))
+    return windows
 
 def enumerate_window(conn, ts_from, ts_to, host=HOST):
     print(f"  CDX {host}/* {ts_from} → {ts_to}")
