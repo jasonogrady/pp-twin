@@ -778,7 +778,26 @@ function Gaps({ stats, db }) {
 }
 
 // ─── Hunter tab ───────────────────────────────────────────────────────────────
-function Hunter({ db }) {
+const BRAILLE_FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+const BAR_FRAMES = ["▏","▎","▍","▌","▋","▊","▉","█","▉","▊","▋","▌","▍","▎"];
+
+function useTick(interval = 110) {
+  const [t, setT] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setT(x => x + 1), interval);
+    return () => clearInterval(id);
+  }, [interval]);
+  return t;
+}
+
+function Spinner({ offset = 0, color, char }) {
+  const t = useTick(110);
+  return <span style={{ color, fontFamily: "monospace", display: "inline-block", width: "1ch", textAlign: "center" }}>
+    {char ?? BRAILLE_FRAMES[(t + offset) % BRAILLE_FRAMES.length]}
+  </span>;
+}
+
+function Hunter({ db, onReload }) {
   const [state, setState] = useState(null);
 
   useEffect(() => {
@@ -808,9 +827,24 @@ function Hunter({ db }) {
         FROM peq_recovery_candidates WHERE status='pending' GROUP BY bucket`) : [],
       recovered: hasRecovered ? q(`
         SELECT id, proposed_post_date, proposed_post_title, proposed_post_author,
-               source, source_url, source_original_url, confidence, reviewed
+               source, source_url, source_original_url, confidence, reviewed, created_at
         FROM peq_posts_recovered ORDER BY id DESC LIMIT 25`) : [],
       recoveredCounts: hasRecovered ? q(`SELECT reviewed, COUNT(*) n FROM peq_posts_recovered GROUP BY reviewed`) : [],
+      // Live activity log: most-recent fetched/failed events, unified and sorted desc
+      activity: (hasRecovered || hasCandidates) ? q(`
+        SELECT created_at ts, 'ok' kind, source, source_original_url url,
+               proposed_post_title title, proposed_post_date date, NULL reason
+          FROM peq_posts_recovered
+          WHERE created_at IS NOT NULL
+        UNION ALL
+        SELECT created_at ts, 'fail' kind, 'wayback' source, original_url url,
+               NULL title, inferred_date date, substr(fail_reason,1,80) reason
+          FROM peq_recovery_candidates
+          WHERE status='failed' AND fail_reason IS NOT NULL
+        ORDER BY ts DESC
+        LIMIT 40
+      `) : [],
+      latestTs: hasRecovered ? scalar(`SELECT MAX(created_at) n FROM peq_posts_recovered`, null) : null,
       telemetry: hasTelemetry ? q(`
         SELECT source,
                SUM(enumerated) enumerated,
@@ -888,14 +922,103 @@ bin/wayback-recover.py fetch --limit 100`}
     </div>
   );
 
+  // Live-ness heuristic: anything fetched within the last 5 minutes counts as "active".
+  const ageSec = state.latestTs
+    ? Math.max(0, (Date.now() - new Date(state.latestTs.replace(" ", "T") + "Z").getTime()) / 1000)
+    : null;
+  const isActive = ageSec !== null && ageSec < 300;
+  const ageLabel = ageSec === null
+    ? "no fetches yet"
+    : ageSec < 60   ? `${Math.round(ageSec)}s ago`
+    : ageSec < 3600 ? `${Math.round(ageSec/60)}m ago`
+    : ageSec < 86400 ? `${Math.round(ageSec/3600)}h ago`
+    : `${Math.round(ageSec/86400)}d ago`;
+
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 18, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginBottom: 14, flexWrap: "wrap" }}>
         <h2 style={{ margin: 0, fontFamily: "Georgia,serif", fontSize: 24, fontWeight: 700, letterSpacing: -.5 }}>Hunter</h2>
         <span style={{ fontFamily: "monospace", fontSize: 11, color: K.muted }}>
-          archive recovery pipeline · staged candidates → fetched bodies → human review
+          archive recovery pipeline · staged → fetched → review
+        </span>
+        <div style={{ marginLeft: "auto" }}>
+          <label style={{ cursor: "pointer", padding: "4px 12px", border: `1px solid ${K.b2}`, borderRadius: 5, fontSize: 11, color: K.muted, fontFamily: "monospace" }}
+            onMouseEnter={e => e.currentTarget.style.borderColor = K.gold}
+            onMouseLeave={e => e.currentTarget.style.borderColor = K.b2}>
+            🔄 Reload DB
+            <input type="file" accept=".db,.sqlite,.sqlite3" style={{ display: "none" }}
+              onChange={e => onReload && e.target.files[0] && onReload(e.target.files[0])} />
+          </label>
+        </div>
+      </div>
+
+      {/* Live status strip — animated braille, derived from snapshot but visually alive */}
+      <div style={{
+        background: K.ink, border: `1px solid ${isActive ? K.gold : K.border}`, borderRadius: 10,
+        padding: "12px 16px", marginBottom: 14, fontFamily: "monospace", fontSize: 12,
+        display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap"
+      }}>
+        <Spinner offset={0} color={isActive ? K.gold : K.muted}/>
+        <span style={{ color: isActive ? K.gold : K.muted, fontWeight: 700, letterSpacing: 1 }}>
+          {isActive ? "ACTIVE" : "IDLE"}
+        </span>
+        <span style={{ color: K.border }}>·</span>
+        <span style={{ color: K.text }}>{state.candTotal.toLocaleString()} candidates</span>
+        <span style={{ color: K.border }}>·</span>
+        <span style={{ color: K.blue }}>
+          <Spinner offset={3} color={K.blue}/> {fetched.toLocaleString()} fetched
+        </span>
+        <span style={{ color: K.border }}>·</span>
+        <span style={{ color: K.gold }}>
+          <Spinner offset={6} color={K.gold}/> {pending.toLocaleString()} pending
+        </span>
+        {failed > 0 && <>
+          <span style={{ color: K.border }}>·</span>
+          <span style={{ color: K.red }}>✗ {failed.toLocaleString()} failed</span>
+        </>}
+        <span style={{ marginLeft: "auto", color: K.muted, fontSize: 11 }}>
+          last fetch: <span style={{ color: isActive ? K.gold : K.muted }}>{ageLabel}</span>
         </span>
       </div>
+
+      {/* Live Activity log */}
+      {state.activity.length > 0 && (
+        <div style={{ background: K.card, border: `1px solid ${K.border}`, borderRadius: 10, padding: "14px 16px", marginBottom: 14 }}>
+          <SectionHeader right={
+            <span style={{ fontFamily: "monospace", fontSize: 10, color: K.muted }}>
+              tail · last {state.activity.length} events · snapshot at load time
+            </span>
+          }>Live Activity</SectionHeader>
+          <div style={{
+            background: K.ink, border: `1px solid ${K.dim}`, borderRadius: 6,
+            padding: "10px 12px", fontFamily: "monospace", fontSize: 11,
+            maxHeight: 280, overflowY: "auto", lineHeight: 1.55,
+          }}>
+            {state.activity.map((row, i) => {
+              const ok = row.kind === "ok";
+              const ts = (row.ts || "").slice(11, 19);
+              return (
+                <div key={i} style={{ display: "flex", gap: 8, color: ok ? K.text : K.muted, whiteSpace: "nowrap", overflow: "hidden" }}>
+                  <Spinner offset={i} color={ok ? K.green : K.red}/>
+                  <span style={{ color: K.muted, minWidth: 72 }}>{ts}</span>
+                  <span style={{ color: ok ? K.green : K.red, minWidth: 18 }}>{ok ? "✓" : "✗"}</span>
+                  <span style={{ color: K.blue, minWidth: 60 }}>{row.source}</span>
+                  <span style={{ color: K.muted, minWidth: 88 }}>{(row.date || "").slice(0, 10)}</span>
+                  <span style={{ flex: 1, color: ok ? K.text : K.red, textOverflow: "ellipsis", overflow: "hidden" }}>
+                    {ok
+                      ? (row.title || row.url)
+                      : `${row.url} → ${row.reason || "(no reason)"}`
+                    }
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ marginTop: 8, fontFamily: "monospace", fontSize: 10, color: K.border }}>
+            Hit <strong style={{ color: K.gold }}>🔄 Reload DB</strong> after running <code style={{ background: K.dim, padding: "1px 5px", borderRadius: 3, color: K.muted }}>bin/wayback-recover.py fetch</code> to see new entries.
+          </div>
+        </div>
+      )}
 
       {/* Top metrics */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(170px,1fr))", gap: 12, marginBottom: 18 }}>
@@ -1307,7 +1430,7 @@ export default function App() {
         )}
 
         {tab==="hunter"&&(
-          <Hunter db={dbInst}/>
+          <Hunter db={dbInst} onReload={loadFile}/>
         )}
 
         {tab==="calendar"&&(

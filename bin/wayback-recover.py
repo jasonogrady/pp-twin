@@ -254,13 +254,40 @@ def cmd_enumerate(args):
     print(f"\nDone. {total} new candidates staged total.")
 
 # ─── fetch + extract ──────────────────────────────────────────────────────────
-def fetch_snapshot(timestamp, original_url):
+# Wayback returns connection-refused / 429 / 503 in bursts when scraping fast.
+# Retry with exponential backoff before declaring a candidate failed.
+def fetch_snapshot(timestamp, original_url, retries=4):
     snap_url = f"https://web.archive.org/web/{timestamp}id_/{original_url}"
     # "id_" suffix asks Wayback to return the original page content without injected toolbar
-    r = requests.get(snap_url, timeout=REQUEST_TIMEOUT,
-                     headers={"User-Agent": USER_AGENT}, allow_redirects=True)
-    r.raise_for_status()
-    return r.text, snap_url
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(snap_url, timeout=REQUEST_TIMEOUT,
+                             headers={"User-Agent": USER_AGENT}, allow_redirects=True)
+            if r.status_code in (429, 503, 504):
+                raise requests.HTTPError(f"{r.status_code} transient from Wayback", response=r)
+            r.raise_for_status()
+            return r.text, snap_url
+        except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
+            last_err = e
+            if attempt == retries - 1:
+                break
+            time.sleep(2 ** attempt)  # 1s, 2s, 4s, 8s
+    raise last_err
+
+# Site-wide chrome titles to reject in favor of slug-derived titles.
+# (Hardcoding the known PowerPage banner; harmless for other sites.)
+SITE_CHROME_TITLE_RE = re.compile(r"o'?grady'?s\s+powerpage", re.I)
+
+def _title_from_slug(original_url):
+    """Derive a human title from a URL slug (e.g. /2006/04/the_apple_core.html → 'The Apple Core')."""
+    path = urlparse(original_url).path
+    slug = path.rstrip("/").split("/")[-1]
+    slug = re.sub(r"\.(html?|php)$", "", slug, flags=re.I)
+    if not slug or slug.isdigit():
+        return None
+    slug = slug.replace("_", " ").replace("-", " ").strip()
+    return slug.title() or None
 
 def extract_post(html, original_url):
     soup = BeautifulSoup(html, "html.parser")
@@ -276,16 +303,20 @@ def extract_post(html, original_url):
                 return c
         return None
 
-    # Title
+    # Title — drop the bare <title> fallback (it's the site-wide banner on PowerPage's
+    # pre-2008 templates). If specific selectors miss, derive from the URL slug.
     title_el = pick(
         soup.find(["h1","h2"], class_=re.compile(r"entry-title|post-title|article-title")),
         soup.find("meta", attrs={"property": "og:title"}),
         soup.find("h1"),
-        soup.find("title"),
     )
     title = None
     if title_el is not None:
         title = title_el.get("content") if title_el.name == "meta" else title_el.get_text(strip=True)
+    if not title or SITE_CHROME_TITLE_RE.search(title or ""):
+        slug_title = _title_from_slug(original_url)
+        if slug_title:
+            title = slug_title
 
     # Body
     body_el = pick(
@@ -336,7 +367,7 @@ def cmd_fetch(args):
     where = "status='pending'"
     if args.min_confidence:
         where += f" AND confidence >= {float(args.min_confidence)}"
-    sql = f"""SELECT id, original_url, cdx_timestamp, inferred_date, confidence
+    sql = f"""SELECT id, original_url, cdx_timestamp, inferred_date, confidence, hint
               FROM peq_recovery_candidates
               WHERE {where}
               ORDER BY confidence DESC, cdx_timestamp ASC
@@ -346,13 +377,19 @@ def cmd_fetch(args):
         print("No pending candidates. Run `enumerate` first.")
         return
     print(f"Fetching {len(rows)} candidates (min confidence={args.min_confidence or 'any'})…")
+    # Hints whose inferred_date has full day-precision; others (e.g. wp-month-slug)
+    # only know YYYY-MM and pad day=01, which is misleading — fall back to the
+    # snapshot timestamp instead.
+    PRECISE_INFERRED_HINTS = ("wp-dated-slug", "news-dated")
     ok = failed = 0
-    for cand_id, url, ts, inferred, conf in rows:
+    for cand_id, url, ts, inferred, conf, hint in rows:
         try:
             html, snap_url = fetch_snapshot(ts, url)
             data = extract_post(html, url)
-            best_date = (normalize_date(data["date"]) or inferred
-                         or f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[8:10]}:{ts[10:12]}:{ts[12:14]}")
+            in_page_date = normalize_date(data["date"])
+            precise_inferred = inferred if hint in PRECISE_INFERRED_HINTS else None
+            snap_date = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[8:10]}:{ts[10:12]}:{ts[12:14]}"
+            best_date = in_page_date or precise_inferred or snap_date
             conn.execute("""
                 INSERT INTO peq_posts_recovered
                   (candidate_id, proposed_post_date, proposed_post_title, proposed_post_content,
@@ -421,6 +458,43 @@ def cmd_reset_candidates(args):
     conn.commit()
     print(f"Cleared {n} pending candidates")
 
+def cmd_retry_failed(args):
+    """Flip status='failed' back to 'pending' so the next fetch run retries them."""
+    conn = open_db()
+    n = conn.execute("UPDATE peq_recovery_candidates SET status='pending', fail_reason=NULL WHERE status='failed'").rowcount
+    conn.commit()
+    print(f"Re-queued {n} failed candidates")
+
+def cmd_rebuild_titles(args):
+    """Re-derive title from URL slug for already-recovered posts whose title looks like site chrome."""
+    conn = open_db()
+    rows = conn.execute("""
+        SELECT id, source_original_url, proposed_post_title, proposed_post_date,
+               (SELECT hint FROM peq_recovery_candidates c WHERE c.id = r.candidate_id),
+               (SELECT cdx_timestamp FROM peq_recovery_candidates c WHERE c.id = r.candidate_id)
+        FROM peq_posts_recovered r
+        WHERE reviewed = 0
+    """).fetchall()
+    updated = 0
+    for rid, url, title, date, hint, ts in rows:
+        changes = {}
+        if not title or SITE_CHROME_TITLE_RE.search(title or ""):
+            new_title = _title_from_slug(url) if url else None
+            if new_title:
+                changes["proposed_post_title"] = new_title
+        # If date ends with -01 00:00:00 and hint is month-precision, prefer snapshot ts
+        if hint not in ("wp-dated-slug", "news-dated") and date and date[8:10] == "01" and ts:
+            snap_date = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[8:10]}:{ts[10:12]}:{ts[12:14]}"
+            if snap_date != date:
+                changes["proposed_post_date"] = snap_date
+        if changes:
+            sets = ", ".join(f"{k}=?" for k in changes)
+            conn.execute(f"UPDATE peq_posts_recovered SET {sets} WHERE id=?",
+                         (*changes.values(), rid))
+            updated += 1
+    conn.commit()
+    print(f"Rebuilt {updated} pending recovered posts (titles + dates)")
+
 # ─── main ─────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -442,6 +516,12 @@ def main():
 
     p_reset = sub.add_parser("reset-candidates", help="Clear pending candidates")
     p_reset.set_defaults(func=cmd_reset_candidates)
+
+    p_retry = sub.add_parser("retry-failed", help="Re-queue failed candidates back to pending")
+    p_retry.set_defaults(func=cmd_retry_failed)
+
+    p_rebuild = sub.add_parser("rebuild-titles", help="Re-derive title/date for pending recovered posts using new extractors")
+    p_rebuild.set_defaults(func=cmd_rebuild_titles)
 
     args = ap.parse_args()
     args.func(args)
