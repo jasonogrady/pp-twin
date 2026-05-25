@@ -1,0 +1,89 @@
+name: hunter
+
+# Bounded recovery work on a 2h cadence. Each run picks up to one stale gap
+# window to enumerate (if any) and fetches a small batch. Results commit back
+# to the repo so the local merge script can pull them down.
+
+on:
+  schedule:
+    - cron: "37 */2 * * *"   # every 2 hours at :37
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Fetch batch size (default 30)"
+        required: false
+        default: "30"
+      min_confidence:
+        description: "Minimum candidate confidence (default 0.7)"
+        required: false
+        default: "0.7"
+      reenumerate_days:
+        description: "Re-enumerate a gap if last scan older than N days (default 1)"
+        required: false
+        default: "1.0"
+
+# Prevent overlapping runs — if a previous tick is still going, queue this one.
+concurrency:
+  group: hunter
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # to commit recovery/hunter.db back to main
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          # Use the workflow's token explicitly so the bot can push.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run tick
+        env:
+          HUNTER_DB: ${{ github.workspace }}/recovery/hunter.db
+        run: |
+          LIMIT="${{ github.event.inputs.limit || '30' }}"
+          MIN_CONF="${{ github.event.inputs.min_confidence || '0.7' }}"
+          REENUM="${{ github.event.inputs.reenumerate_days || '1.0' }}"
+          bin/wayback-recover.py tick \
+            --limit "$LIMIT" \
+            --min-confidence "$MIN_CONF" \
+            --reenumerate-days "$REENUM" \
+            --no-body
+
+      - name: Status summary
+        env:
+          HUNTER_DB: ${{ github.workspace }}/recovery/hunter.db
+        run: bin/wayback-recover.py status
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name  "hunter-bot"
+          git config user.email "hunter@users.noreply.github.com"
+          git add recovery/hunter.db
+          if git diff --cached --quiet; then
+            echo "no changes — skipping commit"
+            exit 0
+          fi
+          # Summarize numbers in the commit message
+          STATS=$(sqlite3 recovery/hunter.db "
+            SELECT
+              'cand=' || COUNT(*) FILTER (WHERE 1) ||
+              ' fetched=' || COUNT(*) FILTER (WHERE status='fetched') ||
+              ' pending=' || COUNT(*) FILTER (WHERE status='pending') ||
+              ' failed='  || COUNT(*) FILTER (WHERE status='failed')
+            FROM peq_recovery_candidates;")
+          REC=$(sqlite3 recovery/hunter.db "SELECT COUNT(*) FROM peq_posts_recovered;")
+          git commit -m "hunter tick — recovered=$REC $STATS"
+          git push

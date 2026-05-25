@@ -2,6 +2,8 @@
 *.db
 *.db-journal
 *.db.tmp
+# cloud-managed recovery state, committed by .github/workflows/hunter.yml
+!recovery/hunter.db
 powerpage*.sql
 powerpage*.sql.gz
 *.sql.gz
@@ -24,3 +26,4 @@ pp-twin-dev/public/powerpage.db
 .claude/
 .idea/
 .vscode/
+.wrangler/

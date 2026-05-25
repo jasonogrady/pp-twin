@@ -346,6 +346,40 @@ The review queue feedback (accept/reject) is what updates the Beta posteriors th
 
 ---
 
+## Currently shipped: GitHub Actions cron MVP
+
+The full daemon design above is the destination. Today (May 2026) a slim MVP is running:
+
+- **Host:** GitHub Actions, free, cron `37 */2 * * *` (every 2 hours)
+- **State:** `recovery/hunter.db` — a 1.4 MB SQLite committed to the repo, contains `peq_recovery_candidates`, `peq_posts_recovered` (no bodies), `hunter_gap_queue`, `hunter_runs`
+- **Per-run budget:** one stale gap window enumerated (if any is due) + up to 30 fetches per tick
+- **Idempotent:** `concurrency.group: hunter` prevents overlap; if nothing changed, no commit
+- **Audit trail:** every run logs to `hunter_runs`; every commit message is `hunter tick — recovered=N cand=… fetched=… …`
+
+Workflow file: [`.github/workflows/hunter.yml`](.github/workflows/hunter.yml)
+Trigger manually: GitHub → Actions → `hunter` → **Run workflow** (lets you override `limit`, `min_confidence`, `reenumerate_days`).
+
+### Local merge
+
+```zsh
+bin/hunter-merge-local.sh           # pull + merge cloud rows into powerpage.db
+bin/hunter-merge-local.sh --dry-run # show what would change
+```
+
+The merge is **idempotent** and matches rows by `(original_url, cdx_timestamp)` for candidates and `(source_original_url, source_snapshot_ts)` for recovered posts. Re-running is a no-op.
+
+### Limits and growth
+
+- **Disk:** ~150 bytes per candidate, ~300 bytes per recovered row (no body). 5,000 / 1,000 = ~1.6 MB. Git can sustain this for years. If bodies are needed, fetch them on-demand locally at accept-time.
+- **Wayback rate-limiting:** GH Actions runners share IPs; expect occasional 429s. The retry-with-backoff on `fetch_snapshot` handles these.
+- **CDX timeouts:** each gap window is chunked to ≤365d and called separately; large windows that 504 retry up to 3× with backoff.
+
+### Next steps to move closer to the full daemon
+
+1. Add per-source telemetry (`hunter_telemetry`) so the Thompson scheduler has data to work from.
+2. Add additional source adapters (`archive.today`, `common_crawl`) — same `tick`-style interface.
+3. Surface `hunter_runs` and live activity in the pp-twin Hunter tab via a fetch of the raw `recovery/hunter.db` from GitHub (no need to wait for local merge).
+
 ## Build phasing
 
 1. **Today (10 min)** — run the existing scraper end-to-end. `bin/wayback-recover.py enumerate && bin/wayback-recover.py fetch --limit 200`. Baseline what Wayback alone covers before building more.

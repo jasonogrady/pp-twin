@@ -44,7 +44,8 @@ except ImportError:
 
 # ─── config ───────────────────────────────────────────────────────────────────
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = PROJECT_DIR / "powerpage.db"
+DEFAULT_DB_PATH = PROJECT_DIR / "powerpage.db"
+DB_PATH = Path(os.environ.get("HUNTER_DB", DEFAULT_DB_PATH))
 HOST = "powerpage.org"
 USER_AGENT = "pp-twin-recovery/1.0 (archive reconstruction for powerpage.org owner)"
 REQUEST_TIMEOUT = 60
@@ -378,7 +379,8 @@ def cmd_fetch(args):
     if not rows:
         print("No pending candidates. Run `enumerate` first.")
         return
-    print(f"Fetching {len(rows)} candidates (min confidence={args.min_confidence or 'any'})…")
+    no_body = bool(getattr(args, "no_body", False))
+    print(f"Fetching {len(rows)} candidates (min confidence={args.min_confidence or 'any'}, no_body={no_body})…")
     # Date priority: in-page > URL-inferred (already day-15 for month-precision)
     # > snapshot timestamp (last resort; clusters by crawl date, not publication).
     ok = failed = 0
@@ -395,7 +397,9 @@ def cmd_fetch(args):
                    proposed_post_author, source, source_url, source_original_url,
                    source_snapshot_ts, confidence)
                 VALUES (?, ?, ?, ?, ?, 'wayback', ?, ?, ?, ?)
-            """, (cand_id, best_date, data["title"], data["body"], data["author"],
+            """, (cand_id, best_date, data["title"],
+                  None if no_body else data["body"],
+                  data["author"],
                   snap_url, url, ts, conf))
             conn.execute("UPDATE peq_recovery_candidates SET status='fetched' WHERE id=?", (cand_id,))
             ok += 1
@@ -409,6 +413,76 @@ def cmd_fetch(args):
         conn.commit()
         time.sleep(RATE_LIMIT_SECONDS)
     print(f"\nDone. {ok} fetched, {failed} failed.")
+
+# ─── tick (one workflow iteration: bounded enumerate + fetch) ────────────────
+def cmd_tick(args):
+    """One iteration of work, sized for GH Actions cron. Picks one stale gap window
+    (if any) and enumerates it, then runs a bounded fetch batch. Idempotent."""
+    conn = open_db()
+    started = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    has_runs = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='hunter_runs'").fetchone()
+    run_id = None
+    if has_runs:
+        run_id = conn.execute(
+            "INSERT INTO hunter_runs (started_at, kind) VALUES (?, 'tick')", (started,)
+        ).lastrowid
+        conn.commit()
+
+    recovered_before = conn.execute("SELECT COUNT(*) FROM peq_posts_recovered").fetchone()[0]
+    failures_before  = conn.execute("SELECT COUNT(*) FROM peq_recovery_candidates WHERE status='failed'").fetchone()[0]
+    candidates_added = 0
+
+    has_queue = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='hunter_gap_queue'").fetchone()
+    if has_queue:
+        row = conn.execute("""
+            SELECT id, start_day, end_day, weekday_count
+            FROM hunter_gap_queue
+            WHERE last_enumerated_at IS NULL
+               OR (julianday('now') - julianday(last_enumerated_at)) > ?
+            ORDER BY (last_enumerated_at IS NULL) DESC,
+                     last_enumerated_at ASC,
+                     weekday_count DESC
+            LIMIT 1
+        """, (args.reenumerate_days,)).fetchone()
+        if row:
+            qid, sd, ed, wc = row
+            print(f"[tick] enumerating gap {sd} → {ed} ({wc}d)")
+            for ts_from, ts_to in _chunk_window(sd, ed):
+                try:
+                    candidates_added += enumerate_window(conn, ts_from, ts_to)
+                except Exception as e:
+                    print(f"  window failed: {e}", file=sys.stderr)
+                time.sleep(RATE_LIMIT_SECONDS)
+            conn.execute(
+                "UPDATE hunter_gap_queue SET last_enumerated_at=? WHERE id=?",
+                (started, qid)
+            )
+            conn.commit()
+        else:
+            print(f"[tick] no stale gap windows (re-enumerate threshold: {args.reenumerate_days}d)")
+
+    print(f"[tick] fetching up to {args.limit} candidates")
+    fetch_args = argparse.Namespace(
+        limit=args.limit, min_confidence=args.min_confidence, no_body=args.no_body
+    )
+    cmd_fetch(fetch_args)
+
+    recovered_after = conn.execute("SELECT COUNT(*) FROM peq_posts_recovered").fetchone()[0]
+    failures_after  = conn.execute("SELECT COUNT(*) FROM peq_recovery_candidates WHERE status='failed'").fetchone()[0]
+
+    if run_id is not None:
+        conn.execute("""
+            UPDATE hunter_runs SET finished_at=?, candidates_added=?, posts_recovered=?, failures=?
+            WHERE id=?
+        """, (datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+              candidates_added,
+              recovered_after - recovered_before,
+              failures_after - failures_before, run_id))
+        conn.commit()
+
+    print(f"[tick] done · +{candidates_added} candidates · "
+          f"+{recovered_after - recovered_before} recovered · "
+          f"+{failures_after - failures_before} new failures")
 
 # ─── status ───────────────────────────────────────────────────────────────────
 def cmd_status(args):
@@ -527,7 +601,16 @@ def main():
     p_fetch = sub.add_parser("fetch", help="Fetch & extract pending candidates")
     p_fetch.add_argument("--limit", type=int, default=50)
     p_fetch.add_argument("--min-confidence", type=float, default=0.7)
+    p_fetch.add_argument("--no-body", action="store_true", help="Skip storing the post body (cloud/disk-budget mode)")
     p_fetch.set_defaults(func=cmd_fetch)
+
+    p_tick = sub.add_parser("tick", help="One bounded iteration of enumerate + fetch (for cron)")
+    p_tick.add_argument("--limit", type=int, default=30)
+    p_tick.add_argument("--min-confidence", type=float, default=0.7)
+    p_tick.add_argument("--no-body", action="store_true", default=True, help="Default on for cloud runs")
+    p_tick.add_argument("--reenumerate-days", type=float, default=1.0,
+                        help="Skip a gap window if it was enumerated within N days (default 1)")
+    p_tick.set_defaults(func=cmd_tick)
 
     p_status = sub.add_parser("status", help="Show recovery progress")
     p_status.set_defaults(func=cmd_status)

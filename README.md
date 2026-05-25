@@ -114,6 +114,19 @@ The Gaps tab visualizes these as a year coverage chart, a top-25 gap-range table
 
 ---
 
+## 24/7 cloud Hunter
+
+`recovery/hunter.db` is a slim SQLite (no post bodies) maintained by a GitHub Actions cron — every 2 hours, the workflow enumerates one stale gap and fetches up to 30 candidates, then commits results back.
+
+```zsh
+bin/hunter-merge-local.sh           # pull cloud rows into powerpage.db, then reload pp-twin
+bin/hunter-merge-local.sh --dry-run # show what would change
+```
+
+Trigger a run on demand: GitHub → Actions → **hunter** → **Run workflow** (with optional `limit` / `min_confidence` / `reenumerate_days` overrides).
+
+Full design: [`HUNTER.md`](HUNTER.md).
+
 ## Recovery workflow
 
 See [`RECOVERY.md`](RECOVERY.md) for the full plan and source-ranking. Quick start:
