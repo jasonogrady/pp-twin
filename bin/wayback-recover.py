@@ -259,7 +259,12 @@ def cmd_enumerate(args):
 # ─── fetch + extract ──────────────────────────────────────────────────────────
 # Wayback returns connection-refused / 429 / 503 in bursts when scraping fast.
 # Retry with exponential backoff before declaring a candidate failed.
-def fetch_snapshot(timestamp, original_url, retries=4):
+class WaybackBlocked(Exception):
+    """Raised when Wayback's playback host refuses/throttles us across all retries —
+    distinct from a genuine per-URL miss (404/parse). The caller should pause, not
+    mark the candidate failed."""
+
+def fetch_snapshot(timestamp, original_url, retries=6):
     snap_url = f"https://web.archive.org/web/{timestamp}id_/{original_url}"
     # "id_" suffix asks Wayback to return the original page content without injected toolbar
     last_err = None
@@ -275,12 +280,46 @@ def fetch_snapshot(timestamp, original_url, retries=4):
             last_err = e
             if attempt == retries - 1:
                 break
-            time.sleep(2 ** attempt)  # 1s, 2s, 4s, 8s
+            time.sleep(min(2 ** attempt, 30))  # 1,2,4,8,16,30s — ride out short playback blocks
+    # Connection-level refusals / persistent transient codes mean the host is blocking us,
+    # not that this URL is missing. Signal that distinctly.
+    if isinstance(last_err, (requests.ConnectionError, requests.Timeout)) or (
+        isinstance(last_err, requests.HTTPError)
+        and getattr(getattr(last_err, "response", None), "status_code", None) in (429, 503, 504)
+    ):
+        raise WaybackBlocked(str(last_err))
     raise last_err
 
 # Site-wide chrome titles to reject in favor of slug-derived titles.
 # (Hardcoding the known PowerPage banner; harmless for other sites.)
 SITE_CHROME_TITLE_RE = re.compile(r"o'?grady'?s\s+powerpage", re.I)
+
+# PowerPage's MovableType-era byline (2003–2008), e.g.:
+#   "Posted by chrisbarylick at January 22, 2008  8:15 AM Category: Rumor …"
+#   "Posted by Bob Snow, contributing editor at January  5, 2005  8:04 AM …"
+# Captures the true author and publication date+time — far more accurate than the
+# URL-inferred day-15 fallback (Wayback often snapshots an old post under a newer crawl).
+_MT_MONTHS = "January|February|March|April|May|June|July|August|September|October|November|December"
+MT_BYLINE_RE = re.compile(
+    r"Posted by\s+(?P<author>.+?)\s+at\s+"
+    r"(?P<date>(?:" + _MT_MONTHS + r")\s+\d{1,2},\s+\d{4}\s+\d{1,2}:\d{2}\s*[AP]M)",
+    re.I,
+)
+
+def _parse_mt_byline(text):
+    """Return (author, 'YYYY-MM-DD HH:MM:SS') from a MovableType byline, or (None, None)."""
+    if not text:
+        return None, None
+    m = MT_BYLINE_RE.search(text)
+    if not m:
+        return None, None
+    author = m.group("author").strip() or None
+    raw = re.sub(r"\s+", " ", m.group("date")).strip()  # collapse the padded double-spaces
+    try:
+        dt = datetime.strptime(raw, "%B %d, %Y %I:%M %p").strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        dt = None
+    return author, dt
 
 def _title_from_slug(original_url):
     """Derive a human title from a URL slug (e.g. /2006/04/the_apple_core.html → 'The Apple Core')."""
@@ -321,35 +360,46 @@ def extract_post(html, original_url):
         if slug_title:
             title = slug_title
 
+    # MovableType-era byline (2003–2008): the most reliable author + date source.
+    posted_el = soup.find(["p", "div", "span"], class_="posted")
+    mt_author, mt_date = _parse_mt_byline(posted_el.get_text(" ", strip=True) if posted_el else None)
+
     # Body
     body_el = pick(
         soup.find("div",  class_=re.compile(r"entry-content|post-content|article-content|story-body|content-body")),
         soup.find("article"),
         soup.find("div",  id=re.compile(r"content$|post-\d+|main-content")),
+        soup.find("div",  class_="content"),   # MovableType-era PowerPage wraps the post here
         soup.find("div",  class_="post"),
     )
+    if body_el is not None:
+        # Drop MovableType chrome that lives inside the content column.
+        for junk in body_el.find_all(["p", "div"], class_=re.compile(r"^(posted|navigation)$")):
+            junk.decompose()
     body = str(body_el) if body_el else None
 
     # Author
-    author_el = pick(
-        soup.find("a",   rel="author"),
-        soup.find(["a","span","div"], class_=re.compile(r"author-name|byline|author")),
-        soup.find("meta", attrs={"name": "author"}),
-    )
-    author = None
-    if author_el is not None:
-        author = author_el.get("content") if author_el.name == "meta" else author_el.get_text(strip=True)
+    author = mt_author
+    if not author:
+        author_el = pick(
+            soup.find("a",   rel="author"),
+            soup.find(["a","span","div"], class_=re.compile(r"author-name|byline|author")),
+            soup.find("meta", attrs={"name": "author"}),
+        )
+        if author_el is not None:
+            author = author_el.get("content") if author_el.name == "meta" else author_el.get_text(strip=True)
 
-    # Date
-    date_str = None
-    date_el = pick(
-        soup.find("meta", attrs={"property": "article:published_time"}),
-        soup.find("meta", attrs={"name": "date"}),
-        soup.find("time"),
-        soup.find(class_=re.compile(r"post-date|entry-date|published")),
-    )
-    if date_el is not None:
-        date_str = date_el.get("datetime") or date_el.get("content") or date_el.get_text(strip=True)
+    # Date — prefer the byline (real publish time); fall back to structured metadata.
+    date_str = mt_date
+    if not date_str:
+        date_el = pick(
+            soup.find("meta", attrs={"property": "article:published_time"}),
+            soup.find("meta", attrs={"name": "date"}),
+            soup.find("time"),
+            soup.find(class_=re.compile(r"post-date|entry-date|published")),
+        )
+        if date_el is not None:
+            date_str = date_el.get("datetime") or date_el.get("content") or date_el.get_text(strip=True)
 
     return {"title": title, "body": body, "author": author, "date": date_str}
 
@@ -370,6 +420,12 @@ def cmd_fetch(args):
     where = "status='pending'"
     if args.min_confidence:
         where += f" AND confidence >= {float(args.min_confidence)}"
+    since = getattr(args, "since", None)
+    until = getattr(args, "until", None)
+    if since:
+        where += f" AND inferred_date >= '{since}'"
+    if until:
+        where += f" AND inferred_date < '{until}'"
     sql = f"""SELECT id, original_url, cdx_timestamp, inferred_date, confidence, hint
               FROM peq_recovery_candidates
               WHERE {where}
@@ -380,10 +436,13 @@ def cmd_fetch(args):
         print("No pending candidates. Run `enumerate` first.")
         return
     no_body = bool(getattr(args, "no_body", False))
-    print(f"Fetching {len(rows)} candidates (min confidence={args.min_confidence or 'any'}, no_body={no_body})…")
+    delay = getattr(args, "delay", None) or RATE_LIMIT_SECONDS
+    print(f"Fetching {len(rows)} candidates (min confidence={args.min_confidence or 'any'}, "
+          f"no_body={no_body}, delay={delay}s)…")
     # Date priority: in-page > URL-inferred (already day-15 for month-precision)
     # > snapshot timestamp (last resort; clusters by crawl date, not publication).
     ok = failed = 0
+    consecutive_blocks = 0
     for cand_id, url, ts, inferred, conf, hint in rows:
         try:
             html, snap_url = fetch_snapshot(ts, url)
@@ -403,15 +462,29 @@ def cmd_fetch(args):
                   snap_url, url, ts, conf))
             conn.execute("UPDATE peq_recovery_candidates SET status='fetched' WHERE id=?", (cand_id,))
             ok += 1
+            consecutive_blocks = 0
             title_disp = (data["title"] or "(no title)")[:80]
             print(f"  ✓ {best_date[:10]} · {title_disp}")
+        except WaybackBlocked as e:
+            # Host is throttling us, not a missing URL. Leave the candidate pending and
+            # back off; bail out if it persists so we don't churn the whole queue.
+            consecutive_blocks += 1
+            print(f"  ⏸ blocked ({consecutive_blocks}) {url[:60]} → {e}", file=sys.stderr)
+            if consecutive_blocks >= 5:
+                print(f"\n⚠ Wayback playback host blocking us after {consecutive_blocks} tries — "
+                      f"stopping. {ok} fetched so far; remaining candidates left pending. "
+                      f"Re-run later to resume.", file=sys.stderr)
+                break
+            time.sleep(min(30 * consecutive_blocks, 120))
+            continue
         except Exception as e:
             conn.execute("UPDATE peq_recovery_candidates SET status='failed', fail_reason=? WHERE id=?",
                          (str(e)[:200], cand_id))
             failed += 1
+            consecutive_blocks = 0
             print(f"  ✗ {url[:80]} → {e}", file=sys.stderr)
         conn.commit()
-        time.sleep(RATE_LIMIT_SECONDS)
+        time.sleep(delay)
     print(f"\nDone. {ok} fetched, {failed} failed.")
 
 # ─── tick (one workflow iteration: bounded enumerate + fetch) ────────────────
@@ -602,6 +675,9 @@ def main():
     p_fetch.add_argument("--limit", type=int, default=50)
     p_fetch.add_argument("--min-confidence", type=float, default=0.7)
     p_fetch.add_argument("--no-body", action="store_true", help="Skip storing the post body (cloud/disk-budget mode)")
+    p_fetch.add_argument("--delay", type=float, help=f"Seconds between requests (default {RATE_LIMIT_SECONDS}); raise to ~3 for large local runs to avoid Wayback throttling")
+    p_fetch.add_argument("--since", help="Only fetch candidates with inferred_date >= this (e.g. 2008 or 2008-01-01)")
+    p_fetch.add_argument("--until", help="Only fetch candidates with inferred_date < this (e.g. 2009 or 2009-01-01)")
     p_fetch.set_defaults(func=cmd_fetch)
 
     p_tick = sub.add_parser("tick", help="One bounded iteration of enumerate + fetch (for cron)")
