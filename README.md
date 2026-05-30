@@ -2,7 +2,7 @@
 
 A local archive explorer + recovery toolkit for [O'Grady's PowerPage](https://www.powerpage.org) — a long-running Apple/Mac blog. Pulls your WordPress database nightly, gives you an instant dashboard, an editorial cockpit, gap analysis, and a Wayback-Machine-driven recovery pipeline for lost posts.
 
-![status](https://img.shields.io/badge/status-v1.1.1-gold) ![license](https://img.shields.io/badge/license-MIT-green)
+![status](https://img.shields.io/badge/status-v1.2-gold) ![license](https://img.shields.io/badge/license-MIT-green)
 
 ---
 
@@ -186,6 +186,14 @@ requirements.txt             Python deps for the scraper
 ---
 
 ## Changelog
+
+### v1.2 — full-text recovery + Mac mini persistence
+- **MovableType byline extraction**: the recovery extractor now parses the 2003–2008 `Posted by <author> at <date>` byline for the true author and publish timestamp — replacing the day-15 URL-inferred guess and correcting candidates Wayback snapshotted under a newer crawl (a "2008" URL whose byline actually reads Jan 2005). Also reads `<div class="content">` (the MovableType post wrapper) so bodies extract instead of coming back empty. The date fix lands in the cloud cron too, even in `--no-body` mode
+- **Persistent local body-fetch daemon** (`bin/hunter-local-recover.sh`): drains the pending candidate queue into full-text recovered posts in `powerpage.db`. Polite drip (small batches + cooldown) to dodge Wayback's playback throttle (~35 requests/burst before it TCP-refuses); gap-year priority (2008 — only 2 live posts — first); resumable across reboots; `--status` / `--once` / `--requeue-bodyless` modes; self-heals on startup
+- **Wayback-block resilience**: `WaybackBlocked` is distinguished from a genuine per-URL miss — blocked candidates stay `pending` (not burned to `failed`), back off, and bail after 5 consecutive blocks so a throttle can't churn the queue. `fetch` gains `--since` / `--until` date filters and `--delay`
+- **LaunchAgent for the Mac mini** (`bin/ai.ogrady.pptwin-recover.plist`, `KeepAlive`+`RunAtLoad`): the daemon survives crashes and reboots. `bin/install-launchd.sh` now manages both agents — `install|uninstall|status|run-now [sync|recover]`
+- **Merge fix**: `bin/hunter-merge-local.sh` imports cloud candidates as `pending` instead of inheriting the cloud's no-body `fetched` status — the latter had been starving the local body-fetcher
+- **Docs**: `HANDOFF.md` — full Mac mini runbook (setup, monitoring, tuning, single-writer/iCloud caveat). Note: the accept→merge step that promotes recovered rows into live `peq_posts` is still unbuilt — the last mile
 
 ### v1.1.1 — public + mobile-reachable
 - Repo flipped public so the Hunter tab's auto-fetched cloud snapshot (`recovery/hunter.db` from `raw.githubusercontent.com`) actually resolves anonymously — required for mobile browsers
