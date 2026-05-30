@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.ogrady.pptwin-recover</string>
+
+  <!-- The script loops forever; KeepAlive + RunAtLoad make launchd (re)start it on
+       login, after a reboot, or if it ever crashes. This is the LOCAL body-fetch
+       daemon — meant for the Mac mini, which stays awake (the MacBook sleeps with
+       the lid closed). Run it on ONE machine only: powerpage.db lives in iCloud,
+       so two writers would create conflict copies. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>"$HOME/Library/Mobile Documents/com~apple~CloudDocs/GitHub/pp-twin/bin/hunter-local-recover.sh"</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Don't respawn faster than once a minute if it exits immediately. -->
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/pptwin-recover.out</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/pptwin-recover.err</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <!-- Optional tuning; defaults live in the script. Raise PP_COOLDOWN if you see
+         Wayback blocks in /tmp/pptwin-recover.err. -->
+    <key>PP_BATCH</key><string>20</string>
+    <key>PP_DELAY</key><string>4</string>
+    <key>PP_COOLDOWN</key><string>360</string>
+  </dict>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

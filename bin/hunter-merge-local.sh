@@ -58,23 +58,15 @@ sqlite3 powerpage.db <<SQL
 ATTACH DATABASE 'recovery/hunter.db' AS cloud;
 BEGIN;
 
+# Import newly discovered candidates as 'pending' locally — do NOT inherit the cloud's
+# 'fetched' status. The cloud fetches metadata only (--no-body); the local daemon
+# (hunter-local-recover.sh) is the source of article BODIES, so every candidate must
+# stay fetchable locally even if the cloud already grabbed its metadata. Inheriting
+# 'fetched' here is what previously starved the body-fetcher.
 INSERT OR IGNORE INTO peq_recovery_candidates
   (original_url, cdx_timestamp, inferred_date, confidence, hint, digest, status, fail_reason)
-SELECT original_url, cdx_timestamp, inferred_date, confidence, hint, digest, status, fail_reason
+SELECT original_url, cdx_timestamp, inferred_date, confidence, hint, digest, 'pending', NULL
 FROM cloud.peq_recovery_candidates;
-
--- Update status on already-known candidates (e.g. cloud successfully fetched something local had pending)
-UPDATE peq_recovery_candidates AS l
-SET status      = (SELECT c.status      FROM cloud.peq_recovery_candidates c
-                   WHERE c.original_url = l.original_url AND c.cdx_timestamp = l.cdx_timestamp),
-    fail_reason = (SELECT c.fail_reason FROM cloud.peq_recovery_candidates c
-                   WHERE c.original_url = l.original_url AND c.cdx_timestamp = l.cdx_timestamp)
-WHERE l.status = 'pending'
-  AND EXISTS (
-    SELECT 1 FROM cloud.peq_recovery_candidates c
-    WHERE c.original_url = l.original_url AND c.cdx_timestamp = l.cdx_timestamp
-      AND c.status != 'pending'
-  );
 
 INSERT INTO peq_posts_recovered
   (candidate_id, proposed_post_date, proposed_post_title, proposed_post_content,

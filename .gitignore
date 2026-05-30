@@ -30,3 +30,7 @@ pp-twin-dev/public/powerpage.db
 
 # Local secrets (host, user, key paths for bin/sync-from-bluehost.sh)
 .env
+
+# Python bytecode
+__pycache__/
+*.pyc
